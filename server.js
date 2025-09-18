@@ -1,170 +1,126 @@
-import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
+
 import Groq from 'groq-sdk';
-import { z } from 'zod';
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(cors({ origin: true }));
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ===== Catalog schemas =====
-const CatalogSchema = z.object({
-  services: z.array(z.object({
-    id: z.number(),
-    name: z.string(),
-    synonyms: z.array(z.string()).optional()
-  })).default([]),
-  barbers: z.array(z.object({
-    id: z.number(),
-    name: z.string()
-  })).default([])
-});
 
-const IntentSchema = z.object({
-  intent: z.enum(['create_appointment', 'get_next_appointment', 'search_services', 'small_talk']),
-  args: z.object({
-    barber: z.union([z.number(), z.null()]).optional(),
-    appointment_date: z.union([z.string(), z.null()]).optional(),
-    start_time: z.union([z.string(), z.null()]).optional(),
-    end_time: z.union([z.string(), z.null()]).optional(),
-    services: z.array(z.union([z.number(), z.string()])).default([]) // puede venir por nombre o id
-  }).partial()
-});
+// ====== LLM CLIENT: GROQ ======
+const USE_LLM = !!process.env.GROQ_API_KEY;
+const MODEL = process.env.MODEL || 'llama-3.1-8b-instant';
+const groq = USE_LLM ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
 
-// util: normalizar texto
-const norm = (s='') => s.normalize('NFD').replace(/\p{Diacritic}/gu,'').toLowerCase().trim();
+// ====== Utilidades ======
+const STEPS = new Set(['selectServices', 'selectBarber', 'pickDate', 'viewSlots', 'confirm', 'done']);
 
-// mapear nombres/sinónimos -> ID determinísticamente
-function mapServicesToIds(requested, catalogServices) {
-  if (!Array.isArray(requested)) return [];
-  const byName = new Map();
-  for (const s of catalogServices) {
-    const keys = [s.name, ...(s.synonyms ?? [])].map(norm);
-    keys.forEach(k => byName.set(k, s.id));
-  }
-  const out = [];
-  for (const item of requested) {
-    if (typeof item === 'number') { out.push(item); continue; }
-    const id = byName.get(norm(String(item)));
-    if (id) out.push(id);
-  }
-  // desduplicar
-  return [...new Set(out)];
+function safeStr(x) {
+  return typeof x === 'string' ? x : '';
+}
+function isPlainObject(x) {
+  return x && typeof x === 'object' && !Array.isArray(x);
 }
 
-function mapBarberToId(requested, catalogBarbers) {
-  if (requested == null) return null;
-  if (typeof requested === 'number') return requested;
-  const needle = norm(String(requested));
-  const found = catalogBarbers.find(b => norm(b.name) === needle);
-  return found ? found.id : null;
+function fallbackByStep({ step, system_hint, context }) {
+  const ctx = context || {};
+  switch (step) {
+    case 'selectServices':
+      return '¿Qué servicios deseas? Responde con los números de la lista, por ejemplo: "1, 3".';
+    case 'selectBarber':
+      return 'Perfecto. Elige un barbero de la lista escribiendo su número (ejemplo: "2").';
+    case 'pickDate':
+      return 'Indícame la fecha en formato YYYY-MM-DD. Ejemplo: 2025-09-20.';
+    case 'viewSlots':
+      if (Array.isArray(ctx.slots) && ctx.slots.length) {
+        const lines = ctx.slots.slice(0, 9).map((s, i) => `${i + 1}) ${s.start_time}–${s.end_time}`).join('\n');
+        return `Horarios disponibles:\n${lines}\n\nResponde con el número de tu preferencia.`;
+      }
+      return 'No hay horarios disponibles para esa fecha. ¿Deseas intentar con otro día?';
+    case 'confirm': {
+      const { barber_id, date, start_time, end_time, service_count } = ctx;
+      const serviciosTxt = service_count ? `${service_count} servicio(s)` : 'los servicios seleccionados';
+      return `Confirmo: ${serviciosTxt}, barbero #${barber_id}, el ${date} de ${start_time} a ${end_time}. ¿Deseas confirmar? (sí/no)`;
+    }
+    case 'done':
+      return '¡Tu cita fue creada correctamente! ¿Necesitas algo más?';
+    default:
+      return safeStr(system_hint) || '¿Podrías indicarme el siguiente dato, por favor?';
+  }
 }
 
-app.get('/', (_req, res) => res.send('Assistant IA lista ✅. Usa POST /chat'));
+function systemPrompt() {
+  return `
+Eres el asistente conversacional de "VIP Stylist / Alex Barbershop".
+Tu función: convertir instrucciones estructuradas en un texto breve y amable en español.
+NO inventes datos, NO cambies pasos, NO tomes decisiones de negocio.
+`;
+}
 
-// ===== main endpoint =====
+function userPrompt({ step, system_hint, context }) {
+  const ctxJson = JSON.stringify(context ?? {}, null, 2);
+  return `
+Paso actual: ${step}
+Instrucción: ${system_hint || '(sin hint)'}
+Contexto JSON:
+${ctxJson}
+
+Redacta una respuesta corta en español, clara y natural.
+`;
+}
+
+// ====== Endpoints ======
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, provider: USE_LLM ? 'groq' : 'fallback', model: USE_LLM ? MODEL : 'templates' });
+});
+
 app.post('/chat', async (req, res) => {
   try {
-    const text = String(req.body?.text ?? '').slice(0, 2000);
-    const catalogInput = CatalogSchema.safeParse(req.body?.catalog ?? {});
-    const catalog = catalogInput.success ? catalogInput.data : { services: [], barbers: [] };
+    const { text, meta } = req.body || {};
+    if (!isPlainObject(meta)) return res.status(400).json({ error: 'meta es requerido' });
 
-    // 1) Construye un prompt que incluya el catálogo por NOMBRE para guiar al LLM
-    const servicesList = catalog.services.map(s => `- ${s.id}: ${s.name}${s.synonyms?.length ? ` (sinónimos: ${s.synonyms.join(', ')})` : ''}`).join('\n');
-    const barbersList  = catalog.barbers.map(b => `- ${b.id}: ${b.name}`).join('\n');
+    const step = safeStr(meta.step);
+    const system_hint = safeStr(meta.system_hint);
+    const context = isPlainObject(meta.context) ? meta.context : {};
 
-    const PLANNER_SYSTEM = `
-Eres el planificador de la barbería VIP Stylist.
-Debes devolver SOLO un JSON válido (sin explicaciones) con este formato:
+    if (!STEPS.has(step)) console.warn('[WARN] step no estándar:', step);
 
-{
-  "intent": "create_appointment|get_next_appointment|search_services|small_talk",
-  "args": {
-    "barber": <id numérico o null>,
-    "appointment_date": "YYYY-MM-DD" o null,
-    "start_time": "HH:mm:ss" o null,
-    "end_time": "HH:mm:ss" o null,
-    "services": [<ids numéricos o nombres exactos de servicios>]
-  }
-}
+    // Si no hay LLM, fallback
+    if (!USE_LLM) {
+      return res.json({ content: fallbackByStep({ step, system_hint, context }), provider: 'fallback' });
+    }
 
-Catálogo actual (usa sólo estos):
-
-Servicios:
-${servicesList || '(sin servicios)'}
-
-Barberos:
-${barbersList || '(sin barberos)'}
-
-Reglas:
-- Si es crear cita y no estás seguro de algún id, puedes usar el NOMBRE del servicio o del barbero; el servidor mapeará a ID.
-- Si el usuario pide un servicio o barbero que NO exista en el catálogo, deja null (barber) o deja el nombre en services para que el servidor lo intente mapear; si no se puede mapear, el array quedará vacío.
-- Fechas: YYYY-MM-DD. Horas: HH:mm:ss (24h).
-- Si falta algo, pon null. No inventes.
-- No devuelvas nada fuera del JSON.
-`;
-
-    // 2) Llama al planner
-    const plan = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+    // ====== LLM con Groq ======
+    const response = await groq.chat.completions.create({
+      model: MODEL,
       temperature: 0.2,
+      max_tokens: 160,
       messages: [
-        { role: 'system', content: PLANNER_SYSTEM },
-        { role: 'user', content: text }
+        { role: 'system', content: systemPrompt() },
+        { role: 'user', content: userPrompt({ step, system_hint, context }) }
       ]
     });
 
-    const raw = plan.choices?.[0]?.message?.content?.trim() || '{}';
-    const jsonStr = raw.replace(/^```json\s*/i, '').replace(/```$/,'');
-    let parsed = IntentSchema.safeParse(JSON.parse(jsonStr));
-    if (!parsed.success) {
-      // fallback: small talk
-      const talk = await groq.chat.completions.create({
-        model: 'llama-3.1-8b-instant',
-        temperature: 0.6,
-        messages: [
-          { role: 'system', content: 'Conversación breve y cálida en español para un cliente de barbería.' },
-          { role: 'user', content: text }
-        ]
-      });
-      const content = talk.choices?.[0]?.message?.content ?? '🙂';
-      return res.json({ ok: true, mode: 'small_talk', content });
-    }
+    const content =
+      response?.choices?.[0]?.message?.content?.trim() ||
+      fallbackByStep({ step, system_hint, context });
 
-    const data = parsed.data;
-
-    // 3) Post-procesar/matchear determinísticamente con el catálogo (IDs válidos)
-    const serviceIds = mapServicesToIds(data.args.services ?? [], catalog.services);
-    const barberId = mapBarberToId(data.args.barber ?? null, catalog.barbers);
-
-    // 4) Responder en formato de negocio para tu frontend
-    return res.json({
-      ok: true,
-      mode: data.intent === 'small_talk' ? 'small_talk' : 'business',
-      intent: data.intent,
-      args: {
-        barber: barberId ?? null,
-        appointment_date: data.args.appointment_date ?? null,
-        start_time: data.args.start_time ?? null,
-        end_time: data.args.end_time ?? null,
-        services: serviceIds // ya mapeados a ID si coincidieron
-      },
-      // útil para debugging/slot-filling en front:
-      meta: {
-        unmatchedServices: (data.args.services ?? []).filter(s => typeof s === 'string' && !serviceIds.length),
-      }
+    res.json({ content, provider: 'groq', model: MODEL });
+  } catch (err) {
+    console.error('[CHAT][ERROR]', err);
+    const meta = isPlainObject(req.body?.meta) ? req.body.meta : {};
+    const content = fallbackByStep({
+      step: safeStr(meta.step),
+      system_hint: safeStr(meta.system_hint),
+      context: isPlainObject(meta.context) ? meta.context : {}
     });
-
-  } catch (e) {
-    console.error('Groq error:', e?.response?.data || e?.message || e);
-    res.status(500).json({ ok: false, error: 'Fallo en el servicio de IA (Groq)' });
+    res.json({ content, provider: 'fallback' });
   }
 });
 
-const port = process.env.PORT || 7070;
-app.listen(port, () => {
-  console.log(`Assistant IA (Groq) en http://localhost:${port}`);
-});
+// Start
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Assistant server (Groq) on :${PORT}`));
