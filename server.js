@@ -54,9 +54,12 @@ function fallbackByStep({ step, system_hint, context }) {
 
 function systemPrompt() {
   return `
-Eres el asistente conversacional de "VIP Stylist / Alex Barbershop".
+Eres el asistente conversacional de "VIP Stylist".
 Tu función: convertir instrucciones estructuradas en un texto breve y amable en español.
 NO inventes datos, NO cambies pasos, NO tomes decisiones de negocio.
+No agregues ofertas/condiciones no provistas.
+No pidas datos sensibles ni confirmes acciones no indicadas.
+Horarios: siempre en formato 12h hh:mmAM/PM sin espacio y con hora de 2 dígitos (ej.: 03:30PM, 12:05AM).
 `;
 }
 
@@ -68,7 +71,8 @@ Instrucción: ${system_hint || '(sin hint)'}
 Contexto JSON:
 ${ctxJson}
 
-Redacta una respuesta corta en español, clara y natural.
+Redacta una respuesta breve en español (máx. 3 oraciones), clara y natural.
+Responde únicamente con el texto final para el usuario, sin explicaciones ni comentarios adicionales.
 `;
 }
 
